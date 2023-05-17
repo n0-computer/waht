@@ -48,6 +48,11 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = cli::Args::parse();
 
+    #[cfg(feature = "thread_per_core")]
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    #[cfg(not(feature = "thread_per_core"))]
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -174,6 +179,9 @@ async fn run(cli: cli::Args) -> anyhow::Result<()> {
                     }
                     anyhow::Result::<(), anyhow::Error>::Ok(())
                 };
+                #[cfg(feature = "thread_per_core")]
+                let handle = waht::util::spawn_worker_task(|| client_fut);
+                #[cfg(not(feature = "thread_per_core"))]
                 let handle = tokio::spawn(client_fut);
                 handles.push(handle);
             }

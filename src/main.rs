@@ -101,7 +101,7 @@ async fn run(cli: cli::Args) -> anyhow::Result<()> {
                 .collect::<Vec<_>>();
             let mut handles = vec![];
             let reqs = Arc::new(AtomicU64::new(0));
-            for i in 0..clients {
+            for _i in 0..clients {
                 let topics = topics.clone();
                 let reqs = reqs.clone();
                 let client_fut = async move {

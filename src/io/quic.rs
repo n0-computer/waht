@@ -122,10 +122,8 @@ pub mod client {
 }
 
 pub mod server {
-    use std::thread;
     use std::{net::SocketAddr, sync::Arc};
 
-    use anyhow::anyhow;
     use quinn::{Endpoint, ServerConfig};
     use tracing::{debug, error, info};
 

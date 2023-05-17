@@ -1,0 +1,6 @@
+/target
+/Cargo.lock
+/research
+/SANDBOX
+/perf.*
+/flamegraph.svg

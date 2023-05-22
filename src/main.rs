@@ -20,13 +20,13 @@ mod cli {
         pub command: Command,
 
         #[clap(short, long)]
-        pub tracker: Vec<SocketAddr>,
+        pub tracker: Vec<String>,
     }
 
     #[derive(Debug, Parser)]
     pub enum Command {
         Server {
-            #[clap(short, long, default_value = "0.0.0.0:1234")]
+            #[clap(short, long, default_value = "0.0.0.0:4399")]
             bind_addr: SocketAddr,
         },
         Provide {
@@ -42,7 +42,7 @@ mod cli {
     }
 }
 
-const DEFAULT_TRACKER: &str = "127.0.0.1:1234";
+const DEFAULT_TRACKER: &str = "quic://localhost:4399";
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -59,9 +59,9 @@ fn main() -> anyhow::Result<()> {
 async fn run(cli: cli::Args) -> anyhow::Result<()> {
     let tracker_addr = cli
         .tracker
-        .get(0)
-        .map(|x| *x)
-        .unwrap_or_else(|| DEFAULT_TRACKER.parse::<SocketAddr>().unwrap());
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| DEFAULT_TRACKER.to_owned());
     let client_config = quic::client::Config::accept_insecure();
     match cli.command {
         cli::Command::Server { bind_addr } => {
@@ -71,14 +71,14 @@ async fn run(cli: cli::Args) -> anyhow::Result<()> {
         cli::Command::Provide { key } => {
             let key = blake3::hash(key.as_bytes()).into();
             let command = proto::Command::ProvideKey(proto::ProvideKey { key, topic: None });
-            let client = quic::connect(tracker_addr, client_config).await?;
+            let client = quic::connect(&tracker_addr, client_config).await?;
             let res = client.request_one(command).await?;
             eprintln!("{res:?}");
         }
         cli::Command::Lookup { key } => {
             let key = blake3::hash(key.as_bytes()).into();
             let command = proto::Command::LookupKey(proto::LookupKey { key, topic: None });
-            let client = quic::connect(tracker_addr, client_config).await?;
+            let client = quic::connect(&tracker_addr, client_config).await?;
             let res = client.request_one(command).await?;
             // eprintln!("Got reply from {}", hex::encode(res.peer_id));
             if let Some(peers) = res.peers {
@@ -140,8 +140,9 @@ async fn run(cli: cli::Args) -> anyhow::Result<()> {
             for _i in 0..clients {
                 let state = state.clone();
                 let client_config = client_config.clone();
+                let tracker_addr = tracker_addr.clone();
                 let client_fut = async move {
-                    let client = quic::connect(tracker_addr, client_config).await.unwrap();
+                    let client = quic::connect(&tracker_addr, client_config).await.unwrap();
                     let command = proto::Command::ProvideKey(proto::ProvideKey {
                         key: *state.choose_key().as_bytes(),
                         topic: None,
@@ -158,7 +159,7 @@ async fn run(cli: cli::Args) -> anyhow::Result<()> {
                                 let permit = semaphore.acquire().await.unwrap();
                                 let command = proto::Command::LookupKey(proto::LookupKey {
                                     key: *state.choose_key().as_bytes(),
-                                        topic: None
+                                    topic: None,
                                 });
                                 let start = Instant::now();
                                 let _res = client.request_one(command).await.unwrap();

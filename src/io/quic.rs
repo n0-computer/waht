@@ -86,7 +86,7 @@ pub mod client {
     use super::tls::configure_client;
     use crate::{
         tracker::client::{ClientActor, ClientHandle},
-        util::generate_peer_id,
+        util::{generate_peer_id, resolve_tracker_url},
     };
 
     #[derive(Clone, Debug)]
@@ -101,7 +101,9 @@ pub mod client {
         }
     }
 
-    pub async fn connect(tracker_addr: SocketAddr, config: Config) -> anyhow::Result<ClientHandle> {
+    pub async fn connect(tracker_url: &str, config: Config) -> anyhow::Result<ClientHandle> {
+        let tracker_addr = resolve_tracker_url(tracker_url).await?;
+        debug!("resolved tracker url {tracker_url} to {tracker_addr}");
         let (peer_id, _signing_key) = generate_peer_id();
         let bind_addr: SocketAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
         let mut endpoint = Endpoint::client(bind_addr)?;

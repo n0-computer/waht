@@ -1,16 +1,64 @@
-use std::{env, path::PathBuf};
+use std::{env, net::SocketAddr, path::PathBuf};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail, Context};
 use ed25519_dalek::SigningKey;
+use url::{Host, Url};
 
 use crate::tracker::PeerId;
 
+pub const WAHT_DEFAULT_PORT: u16 = 4399;
 pub const WAHT_DIR: &str = "waht";
+pub const WAHT_SCHEME: &str = "quic";
 
 pub fn generate_peer_id() -> (PeerId, SigningKey) {
     let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
     let peer_id: PeerId = signing_key.verifying_key().to_bytes();
     (peer_id, signing_key)
+}
+
+pub fn parse_tracker_url(url: &str) -> anyhow::Result<(url::Host<String>, u16)> {
+    let url = Url::parse(url)?;
+    if url.scheme() != WAHT_SCHEME {
+        bail!("Invalid waht URL: Only quic: scheme is supported");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("Invalid waht URL: Username and password are not supported");
+    }
+    if !url.path().is_empty() {
+        bail!("Invalid waht URL: Paths are not supported")
+    }
+    if url.query().is_some() {
+        bail!("Invalid waht URL: Query is not supported")
+    }
+    if url.fragment().is_some() {
+        bail!("Invalid waht URL: Fragment is not supported")
+    }
+    if url.host().is_none() {
+        bail!("Invalid waht URL: Host is required")
+    }
+    Ok((
+        url.host().unwrap().to_owned(),
+        url.port().unwrap_or(WAHT_DEFAULT_PORT),
+    ))
+}
+
+/// Parse and resolve a tracker URL to a socket address.
+///
+/// The URL scheme has to be "quic:". If the host part is a domain, it is resolved
+/// via the system's DNS resolver. If the port is missing, the waht default port
+/// is used.
+pub async fn resolve_tracker_url(url: &str) -> anyhow::Result<SocketAddr> {
+    let (host, port) = parse_tracker_url(url)?;
+    let addr = match host {
+        Host::Ipv4(ip) => (ip, port).into(),
+        Host::Ipv6(ip) => (ip, port).into(),
+        Host::Domain(domain) => tokio::net::lookup_host(format!("{domain}:{port}"))
+            .await
+            .context("Failed to resolve domain")?
+            .next()
+            .context("Failed to resolve domain")?,
+    };
+    Ok(addr)
 }
 
 /// Returns the path to the user's waht data directory.

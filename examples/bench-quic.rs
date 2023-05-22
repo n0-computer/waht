@@ -32,9 +32,9 @@ async fn main() {
     tracing_subscriber::fmt::init();
     let opts = Cli::parse();
 
-    let tracker_addr: SocketAddr = "127.0.0.1:39210".parse().unwrap();
+    let tracker_addr = "127.0.0.1:39210";
     let mut handles: Vec<JoinHandle<anyhow::Result<()>>> = vec![];
-    let handle = spawn(quic::listen(tracker_addr, Default::default()));
+    let handle = spawn(quic::listen(tracker_addr.parse().unwrap(), Default::default()));
     handles.push(handle);
 
     let topics: Vec<Topic> = (0..opts.clients).map(|_x| rand::random()).collect();
@@ -59,14 +59,14 @@ async fn main() {
                     let _res = client
                         .request_one(Command::ProvideKey(proto::ProvideKey {
                             key: *keys.choose(&mut rng).unwrap(),
-                            topic: None
+                            topic: None,
                         }))
                         .await?;
                     loop {
                         let _res = client
                             .request_one(Command::LookupKey(proto::LookupKey {
                                 key: *keys.choose(&mut rng).unwrap(),
-                                topic: None
+                                topic: None,
                             }))
                             .await?;
                         reqs.fetch_add(1, Ordering::Relaxed);

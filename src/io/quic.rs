@@ -107,7 +107,6 @@ pub mod client {
         let mut endpoint = Endpoint::client(bind_addr)?;
         endpoint.set_default_client_config(configure_client(config.tls_accept_insecure));
 
-        // let state = ClientState::new(addr.into(), peer_id, Default::default());
         let (actor, conn_tx, handle) = ClientActor::create(peer_id);
         tokio::spawn(async move {
             match actor.run().await {

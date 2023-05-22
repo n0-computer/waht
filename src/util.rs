@@ -125,11 +125,6 @@ pub mod time {
             self.items.iter()
         }
     }
-    pub trait HasTtl<K: Hash + PartialEq> {
-        fn id(&self) -> K;
-        fn ttl(&self) -> Instant;
-        fn set_ttl(&self, ttl: Instant) -> Instant;
-    }
 
     pub struct InstantMap<T> {
         inner: BTreeMap<Instant, HashSet<T>>,

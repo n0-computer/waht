@@ -1,83 +1,78 @@
+use anyhow::Context;
 pub use client::*;
-use flume::Sender;
 use quinn::Connecting;
 pub use server::*;
-use tracing::{debug, warn};
+use tokio::sync::mpsc::Sender;
 
 use crate::io::write_message;
 
-use super::{read_message, ConnEvent, ConnHandle, PacketIn};
+use super::{read_message, ConnEvent, ConnHandle};
 
 pub const WAHT_ALPN: &[u8] = b"n0/waht/0";
 
 pub mod tls;
 
-pub async fn handle_conn(
+pub async fn conn_actor(
     conn: Connecting,
-    in_tx: Sender<ConnEvent>,
+    tx: Sender<ConnEvent>,
     is_initiator: bool,
 ) -> anyhow::Result<()> {
-    let mut write_buf = vec![];
-    let mut read_buf = vec![];
-
     let conn = conn.await?;
+    let conn_id = conn.stable_id();
 
     let (mut send, mut recv) = match is_initiator {
         true => conn.open_bi().await?,
         false => conn.accept_bi().await?,
     };
 
-    let conn_id = conn.stable_id();
+    let (handle, mut rx, cancel) = ConnHandle::new(conn_id, conn.remote_address());
+    tx.send(ConnEvent::Open(conn_id, handle)).await?;
 
-    let (handle, out_rx) = ConnHandle::new(conn_id, conn.remote_address());
-    in_tx.send_async(ConnEvent::Open(handle)).await?;
-
-    // write loop
-    let writer = tokio::spawn(async move {
+    let mut write_buf = vec![];
+    let cancel_clone = cancel.clone();
+    let send_loop = tokio::spawn(async move {
         loop {
-            let message = out_rx.recv_async().await?;
-            write_message(&mut send, &message, &mut write_buf).await?;
-            debug!("writer: wrote");
-        }
-    });
-
-    // read loop
-    let tx = in_tx.clone();
-    let reader = tokio::spawn(async move {
-        loop {
-            let message = read_message(&mut recv, &mut read_buf).await?;
-            if let Some(message) = message {
-                tx.send_async(ConnEvent::Packet(PacketIn {
-                    // from: peer_id,
-                    conn_id,
-                    message,
-                }))
-                .await?;
-            } else {
-                break;
+            tokio::select! {
+                // allow to cancel the loop
+                _ = cancel_clone.cancelled() => break,
+                // write outgoing messages
+                message = rx.recv() => {
+                    match message {
+                        Some(message) => write_message(&mut send, &message, &mut write_buf).await.context("write loop errored")?,
+                        None =>  cancel_clone.cancel(),
+                    }
+                }
             }
         }
         Ok(())
     });
-    let res: anyhow::Result<()> = {
-        let res1 = reader.await?;
-        let res2 = writer.await?;
-        res1.and_then(|_| res2)
-    };
 
-    if let Err(err) = &res {
-        warn!(
-            "Connection from {} closed with error: {err:?}",
-            conn.remote_address()
-        );
-    }
+    let tx_clone = tx.clone();
+    let mut read_buf = vec![];
+    let recv_loop = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                // allow to cancel the loop
+                _ = cancel.cancelled() => break,
+                // read and forward incoming messages
+                message = read_message(&mut recv, &mut read_buf) => {
+                    let message = message?;
+                    if let Err(_channel_closed) = tx_clone
+                        .send(ConnEvent::Packet(conn_id, message))
+                        .await
+                    {
+                        cancel.cancel();
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
 
-    in_tx
-        .send_async(ConnEvent::Close(conn.stable_id(), conn.remote_address()))
-        .await?;
+    let (res, _, _) = futures::future::select_all([send_loop, recv_loop]).await;
+    let res: anyhow::Result<()> = res?;
 
-    // TODO: Reason
-    conn.close(0u32.into(), "Closed".as_bytes());
+    tx.send(ConnEvent::Close(conn_id)).await?;
     res
 }
 
@@ -87,33 +82,44 @@ pub mod client {
     use quinn::Endpoint;
     use tracing::{debug, error};
 
-    use super::handle_conn;
+    use super::conn_actor;
     use super::tls::configure_client;
     use crate::{
-        tracker::client::{ClientActor, ClientHandle, ClientState},
+        tracker::client::{ClientActor, ClientHandle},
         util::generate_peer_id,
     };
 
-    pub async fn connect(addr: SocketAddr) -> anyhow::Result<ClientHandle> {
+    #[derive(Clone, Debug)]
+    pub struct Config {
+        pub tls_accept_insecure: bool,
+    }
+    impl Config {
+        pub fn accept_insecure() -> Self {
+            Self {
+                tls_accept_insecure: true,
+            }
+        }
+    }
+
+    pub async fn connect(tracker_addr: SocketAddr, config: Config) -> anyhow::Result<ClientHandle> {
         let (peer_id, _signing_key) = generate_peer_id();
         let bind_addr: SocketAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
         let mut endpoint = Endpoint::client(bind_addr)?;
-        endpoint.set_default_client_config(configure_client());
-        // let mut conn = conn.await?;
+        endpoint.set_default_client_config(configure_client(config.tls_accept_insecure));
 
-        let state = ClientState::new(addr.into(), peer_id, Default::default());
-        let (actor, conn_tx, handle) = ClientActor::create(state);
+        // let state = ClientState::new(addr.into(), peer_id, Default::default());
+        let (actor, conn_tx, handle) = ClientActor::create(peer_id);
         tokio::spawn(async move {
             match actor.run().await {
-                Err(err) => error!("client state actor failed: {err}"),
+                Err(err) => error!("client state actor failed: {err:?}"),
                 Ok(()) => debug!("client state actor closed"),
             }
         });
 
-        let conn = endpoint.connect(addr, "localhost")?;
+        let conn = endpoint.connect(tracker_addr, "localhost")?;
         tokio::spawn(async move {
-            match handle_conn(conn, conn_tx, true).await {
-                Err(err) => error!("client conn actor failed: {err}"),
+            match conn_actor(conn, conn_tx.clone(), true).await {
+                Err(err) => error!("client conn actor failed: {err:?}"),
                 Ok(()) => debug!("client conn actor closed"),
             }
         });
@@ -124,60 +130,81 @@ pub mod client {
 pub mod server {
     use std::{net::SocketAddr, sync::Arc};
 
-    use quinn::{Endpoint, ServerConfig};
-    use tracing::{debug, error, info};
+    use quinn::Endpoint;
+    use tokio::sync::mpsc::Sender;
+    use tracing::{debug, info};
 
-    use crate::io::FromConn;
-    use crate::tracker::server::{ServerActor, ServerState};
+    use crate::io::ConnEvent;
+    use crate::tracker::server::{ServerActor, ServerState, TrackerConfig};
     use crate::util::generate_peer_id;
 
-    use super::{handle_conn, tls};
+    use super::{conn_actor, tls};
 
     const MAX_CONNECTIONS: u32 = 4096;
-    const MAX_STREAMS: u64 = 10;
+    const MAX_STREAMS: u32 = 10;
 
-    #[derive(Debug, Default)]
-    pub struct Config {}
+    #[derive(Debug)]
+    pub struct Config {
+        pub tracker: TrackerConfig,
+        pub tls_server_name: String,
+        pub tls_self_signed: bool,
+    }
+    impl Default for Config {
+        fn default() -> Self {
+            Self {
+                tracker: TrackerConfig::default(),
+                tls_server_name: "localhost".into(),
+                tls_self_signed: true,
+            }
+        }
+    }
 
-    pub async fn listen(bind_addr: SocketAddr, _config: Config) -> anyhow::Result<()> {
+    pub async fn listen(bind_addr: SocketAddr, config: Config) -> anyhow::Result<()> {
         let (peer_id, _signing_key) = generate_peer_id();
-        let state = ServerState::new(peer_id);
+        let state = ServerState::with_config(peer_id, config.tracker);
 
-        let (actor, in_tx) = ServerActor::create(state);
+        let (state_actor, from_conn_tx) = ServerActor::create(state);
+        let state_handle = tokio::spawn(state_actor.run());
 
-        let state_handle = tokio::spawn(actor.run());
-        let server_config = server_config()?;
-
+        let server_config = tls_server_config(config.tls_server_name, config.tls_self_signed)?;
         let endpoint = bind_server_endpoint(bind_addr, server_config)?;
-        endpoint_actor(endpoint, in_tx).await?;
+        let endpoint_handle = endpoint_actor(endpoint, from_conn_tx);
 
+        endpoint_handle.await?;
         state_handle.await??;
 
         Ok(())
     }
 
-    async fn endpoint_actor(endpoint: Endpoint, in_tx: FromConn) -> anyhow::Result<()> {
-        info!("Server listening on quic://{}", endpoint.local_addr()?);
-
+    async fn endpoint_actor(endpoint: Endpoint, tx: Sender<ConnEvent>) -> anyhow::Result<()> {
+        info!("server listening on quic://{}", endpoint.local_addr()?);
         while let Some(conn) = endpoint.accept().await {
             let from_addr = conn.remote_address();
-            debug!("connection incoming from {}", from_addr);
-            let fut = handle_conn(conn, in_tx.clone(), false);
+            debug!("connection incoming from {from_addr}");
+            let fut = conn_actor(conn, tx.clone(), false);
             tokio::spawn(async move {
-                if let Err(e) = fut.await {
-                    error!("connection failed: {reason}", reason = e.to_string())
-                }
+                let res = fut.await;
+                let reason = res
+                    .map(|_| String::new())
+                    .unwrap_or_else(|err| format!(": {}", err.to_string()));
+                debug!("connection closed from {from_addr}{reason}");
             });
         }
         Ok(())
     }
 
-    fn server_config() -> anyhow::Result<ServerConfig> {
-        let tls_server_config = tls::make_server_config(false)?;
+    fn tls_server_config(
+        server_name: String,
+        self_signed: bool,
+    ) -> anyhow::Result<quinn::ServerConfig> {
+        if !self_signed {
+            anyhow::bail!("ACME certificate generation is not yet supported");
+        }
+        let tls_server_config = tls::make_selfsigned_server_config(false, server_name)?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(tls_server_config));
         let mut transport_config = quinn::TransportConfig::default();
         transport_config
-            .max_concurrent_bidi_streams(MAX_STREAMS.try_into()?)
+            .max_concurrent_bidi_streams(MAX_STREAMS.into())
             .max_concurrent_uni_streams(0u32.into());
 
         server_config
@@ -188,9 +215,8 @@ pub mod server {
 
     fn bind_server_endpoint(
         bind_addr: SocketAddr,
-        server_config: ServerConfig,
+        server_config: quinn::ServerConfig,
     ) -> anyhow::Result<Endpoint> {
-        // let socket = std::net::UdpSocket::bind(bind_addr)?;
         let socket = socket2::Socket::new(
             // TODO: Support IPV6
             socket2::Domain::IPV4,
@@ -204,7 +230,7 @@ pub mod server {
             Default::default(),
             Some(server_config),
             socket.into(),
-            Arc::new(quinn::TokioRuntime {}), // quinn::default_runtime().expect("no async runtime found"),
+            Arc::new(quinn::TokioRuntime {}),
         )?;
         Ok(endpoint)
     }

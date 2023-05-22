@@ -34,9 +34,6 @@ async fn main() {
 
     let tracker_addr: SocketAddr = "127.0.0.1:39210".parse().unwrap();
     let mut handles: Vec<JoinHandle<anyhow::Result<()>>> = vec![];
-    // let config = quic::server::Config {
-    //     socket_threads: Some(opts.socket_threads),
-    // };
     let handle = spawn(quic::listen(tracker_addr, Default::default()));
     handles.push(handle);
 
@@ -51,32 +48,38 @@ async fn main() {
 
     for i in 0..opts.clients {
         let reqs = reqs.clone();
-        let topics = topics.clone();
+        let keys = topics.clone();
         let thread = thread::Builder::new().name(format!("waht-client-{i}"));
-        thread.spawn(move || {
-            let fut = async move {
-                let client = quic::connect(tracker_addr).await?;
-                let _res = client
-                    .request_one(Command::ProvideTopic(proto::ProvideTopic {
-                        topic: *topics.choose(&mut rng).unwrap(),
-                    }))
-                    .await?;
-                loop {
+        thread
+            .spawn(move || {
+                let fut = async move {
+                    let client =
+                        quic::connect(tracker_addr, quic::client::Config::accept_insecure())
+                            .await?;
                     let _res = client
-                        .request_one(Command::LookupTopic(proto::LookupTopic {
-                            topic: *topics.choose(&mut rng).unwrap(),
+                        .request_one(Command::ProvideKey(proto::ProvideKey {
+                            key: *keys.choose(&mut rng).unwrap(),
+                            topic: None
                         }))
                         .await?;
-                    reqs.fetch_add(1, Ordering::Relaxed);
-                }
-            };
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let res: anyhow::Result<()> = rt.block_on(fut);
-            res
-        }).unwrap();
+                    loop {
+                        let _res = client
+                            .request_one(Command::LookupKey(proto::LookupKey {
+                                key: *keys.choose(&mut rng).unwrap(),
+                                topic: None
+                            }))
+                            .await?;
+                        reqs.fetch_add(1, Ordering::Relaxed);
+                    }
+                };
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let res: anyhow::Result<()> = rt.block_on(fut);
+                res
+            })
+            .unwrap();
     }
     let report = tokio::spawn(async move {
         let start = Instant::now();

@@ -30,13 +30,14 @@ mod cli {
             bind_addr: SocketAddr,
         },
         Provide {
-            topic: String,
+            key: String,
         },
         Lookup {
-            topic: String,
+            key: String,
         },
         LoadTest {
             clients: usize,
+            parallel_requests: usize,
         },
     }
 }
@@ -61,22 +62,23 @@ async fn run(cli: cli::Args) -> anyhow::Result<()> {
         .get(0)
         .map(|x| *x)
         .unwrap_or_else(|| DEFAULT_TRACKER.parse::<SocketAddr>().unwrap());
+    let client_config = quic::client::Config::accept_insecure();
     match cli.command {
         cli::Command::Server { bind_addr } => {
             let config = quic::server::Config::default();
             quic::listen(bind_addr, config).await?;
         }
-        cli::Command::Provide { topic } => {
-            let topic = blake3::hash(topic.as_bytes()).into();
-            let command = proto::Command::ProvideTopic(proto::ProvideTopic { topic });
-            let client = quic::connect(tracker_addr).await?;
+        cli::Command::Provide { key } => {
+            let key = blake3::hash(key.as_bytes()).into();
+            let command = proto::Command::ProvideKey(proto::ProvideKey { key, topic: None });
+            let client = quic::connect(tracker_addr, client_config).await?;
             let res = client.request_one(command).await?;
             eprintln!("{res:?}");
         }
-        cli::Command::Lookup { topic } => {
-            let topic = blake3::hash(topic.as_bytes()).into();
-            let command = proto::Command::LookupTopic(proto::LookupTopic { topic });
-            let client = quic::connect(tracker_addr).await?;
+        cli::Command::Lookup { key } => {
+            let key = blake3::hash(key.as_bytes()).into();
+            let command = proto::Command::LookupKey(proto::LookupKey { key, topic: None });
+            let client = quic::connect(tracker_addr, client_config).await?;
             let res = client.request_one(command).await?;
             // eprintln!("Got reply from {}", hex::encode(res.peer_id));
             if let Some(peers) = res.peers {
@@ -95,27 +97,79 @@ async fn run(cli: cli::Args) -> anyhow::Result<()> {
                 eprintln!("No peers found.")
             }
         }
-        cli::Command::LoadTest { clients } => {
-            let topics = (0u8..9)
-                .map(|i| blake3::hash(&i.to_be_bytes()))
-                .collect::<Vec<_>>();
+        cli::Command::LoadTest {
+            clients,
+            parallel_requests,
+        } => {
+            struct State {
+                reqs: AtomicU64,
+                time_total: AtomicU64,
+                time_min: AtomicU64,
+                time_max: AtomicU64,
+                keys: Vec<blake3::Hash>,
+            }
+            impl State {
+                fn new(num_keys: usize) -> Arc<Self> {
+                    let keys = (0..num_keys)
+                        .map(|i| blake3::hash(&i.to_be_bytes()))
+                        .collect::<Vec<_>>();
+                    Arc::new(State {
+                        reqs: Default::default(),
+                        time_total: Default::default(),
+                        time_min: u64::MAX.into(),
+                        time_max: Default::default(),
+                        keys,
+                    })
+                }
+                fn complete(&self, time: Duration) {
+                    self.time_max
+                        .fetch_max(time.as_micros() as u64, Ordering::Relaxed);
+                    self.time_min
+                        .fetch_min(time.as_micros() as u64, Ordering::Relaxed);
+                    self.time_total
+                        .fetch_add(time.as_micros() as u64, Ordering::Relaxed);
+                    self.reqs.fetch_add(1, Ordering::Relaxed);
+                }
+                fn choose_key(&self) -> &blake3::Hash {
+                    self.keys.choose(&mut rand::rngs::OsRng {}).unwrap()
+                }
+            }
+
+            let state = State::new(10);
             let mut handles = vec![];
-            let reqs = Arc::new(AtomicU64::new(0));
             for _i in 0..clients {
-                let topics = topics.clone();
-                let reqs = reqs.clone();
+                let state = state.clone();
+                let client_config = client_config.clone();
                 let client_fut = async move {
-                    let client = quic::connect(tracker_addr).await?;
-                    let command = proto::Command::ProvideTopic(proto::ProvideTopic {
-                        topic: *topics.choose(&mut rand::rngs::OsRng {}).unwrap().as_bytes(), // topic: *topics[i].as_bytes(),
+                    let client = quic::connect(tracker_addr, client_config).await.unwrap();
+                    let command = proto::Command::ProvideKey(proto::ProvideKey {
+                        key: *state.choose_key().as_bytes(),
+                        topic: None,
                     });
-                    client.request_one(command).await?;
-                    for _i in 0.. {
-                        let command = proto::Command::LookupTopic(proto::LookupTopic {
-                            topic: *topics.choose(&mut rand::rngs::OsRng {}).unwrap().as_bytes(), // topic: *topics[i % 8].as_bytes(),
+                    let _res = client.request_one(command).await.unwrap();
+                    let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel_requests));
+                    let mut handles = vec![];
+                    for _i in 0..parallel_requests {
+                        let client = client.clone();
+                        let state = state.clone();
+                        let semaphore = semaphore.clone();
+                        let handle = tokio::spawn(async move {
+                            loop {
+                                let permit = semaphore.acquire().await.unwrap();
+                                let command = proto::Command::LookupKey(proto::LookupKey {
+                                    key: *state.choose_key().as_bytes(),
+                                        topic: None
+                                });
+                                let start = Instant::now();
+                                let _res = client.request_one(command).await.unwrap();
+                                state.complete(start.elapsed());
+                                drop(permit);
+                            }
                         });
-                        let _res = client.request_one(command).await?;
-                        reqs.fetch_add(1, Ordering::Relaxed);
+                        handles.push(handle);
+                    }
+                    for handle in handles {
+                        handle.await.unwrap();
                     }
                     anyhow::Result::<(), anyhow::Error>::Ok(())
                 };
@@ -130,18 +184,24 @@ async fn run(cli: cli::Args) -> anyhow::Result<()> {
                 loop {
                     tokio::time::sleep(Duration::from_millis(1000)).await;
                     let now = Instant::now();
-                    let reqs = reqs.load(Ordering::Relaxed) as f64;
+                    let reqs = state.reqs.load(Ordering::Relaxed) as f64;
+                    let times = state.time_total.load(Ordering::Relaxed) as f64;
                     println!(
-                        "last reqs/s {:.2} total req/s {:.2}",
+                        "reqs/s {:10.2} | total req/s {:10.2} | mean {:6.2}µs | min {:4}µs | max {:4}µs",
                         (reqs - last_reqs) / last_now.elapsed().as_secs_f64(),
-                        (reqs / start.elapsed().as_secs_f64())
+                        (reqs / start.elapsed().as_secs_f64()),
+                        (times / reqs),
+                        state.time_min.load(Ordering::Relaxed),
+                        state.time_max.load(Ordering::Relaxed),
                     );
                     last_now = now;
                     last_reqs = reqs;
                 }
             });
             // stop on the first error.
-            select_all(handles).await.0.unwrap().unwrap();
+            let res = select_all(handles).await.0;
+            println!("res {res:?}");
+            res.unwrap().unwrap();
         }
     }
     Ok(())

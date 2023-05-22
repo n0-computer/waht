@@ -31,6 +31,15 @@ impl Default for PeerInfo {
         }
     }
 }
+impl PeerInfo {
+    pub fn with_addr(addr: SocketAddr) -> Self {
+        Self {
+            use_from_addr: false,
+            addrs: vec![addr],
+            relay: None,
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TrackerInfo {
@@ -64,8 +73,10 @@ pub enum Error {
     InvalidSignature(#[from] ed25519_dalek::SignatureError),
     #[error("Request timed out")]
     Timeout,
-    #[error("Message too long")]
-    MessageTooLong,
+    #[error("Incoming message too long")]
+    IncomingMessageTooLong,
+    #[error("Outgoing message too long")]
+    OutgoingMessageTooLong,
     #[error("IO error: {0}")]
     IO(#[from] io::Error),
     #[error("Protocol error: {0}")]

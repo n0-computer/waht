@@ -33,6 +33,7 @@ pub async fn conn_actor(
     let send_loop = tokio::spawn(async move {
         loop {
             tokio::select! {
+                biased;
                 // allow to cancel the loop
                 _ = cancel_clone.cancelled() => break,
                 // write outgoing messages
@@ -52,6 +53,7 @@ pub async fn conn_actor(
     let recv_loop = tokio::spawn(async move {
         loop {
             tokio::select! {
+                biased;
                 // allow to cancel the loop
                 _ = cancel.cancelled() => break,
                 // read and forward incoming messages

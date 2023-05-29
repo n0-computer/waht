@@ -16,6 +16,14 @@ pub fn generate_peer_id() -> (PeerId, SigningKey) {
     (peer_id, signing_key)
 }
 
+pub fn transpose<T, E>(res: Result<Option<T>, E>) -> Option<Result<T, E>> {
+    match res {
+        Ok(Some(res)) => Some(Ok(res)),
+        Ok(None) => None,
+        Err(err) => Some(Err(err)),
+    }
+}
+
 pub fn parse_tracker_url(url: &str) -> anyhow::Result<(url::Host<String>, u16)> {
     let url = Url::parse(url)?;
     if url.scheme() != WAHT_SCHEME {

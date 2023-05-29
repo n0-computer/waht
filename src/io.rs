@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc::{self, Receiver, Sender},
@@ -67,8 +68,18 @@ impl ConnHandle {
 
 pub async fn read_message<R: AsyncRead + Send + Unpin>(
     reader: &mut R,
-    buf: &mut Vec<u8>,
+    mut buf: &mut BytesMut,
 ) -> Result<Message, Error> {
+    read_message_inner(reader, &mut buf).await?;
+    let message = parse_and_validate_message(&buf)?;
+    buf.clear();
+    Ok(message)
+}
+
+pub async fn read_message_inner<R: AsyncRead + Send + Unpin, B: BufMut>(
+    reader: &mut R,
+    buf: B,
+) -> Result<(), Error> {
     let len = reader.read_u32().await? as usize;
     if len == 0 {
         return Err(Error::InvalidMessage);
@@ -76,26 +87,29 @@ pub async fn read_message<R: AsyncRead + Send + Unpin>(
     if len > MAX_MESSAGE_LEN {
         return Err(Error::IncomingMessageTooLong);
     }
-    if len > buf.len() {
-        buf.resize(len, 0u8);
+    if len > buf.remaining_mut() {
+        return Err(Error::BufferTooSmall);
     }
-    reader.read_exact(&mut buf[..len]).await?;
-    let message = parse_and_validate_message(&buf[..len])?;
-    Ok(message)
+    let mut buf = buf.limit(len);
+    while buf.has_remaining_mut() {
+        reader.read_buf(&mut buf).await?;
+    }
+    Ok(())
 }
 
 pub async fn write_message<W: AsyncWrite + Send + Unpin>(
     writer: &mut W,
     message: &Message,
-    buf: &mut Vec<u8>,
+    buf: &mut BytesMut,
 ) -> Result<(), Error> {
     let len = postcard::experimental::serialized_size(&message)?;
     if len > MAX_MESSAGE_LEN {
         return Err(Error::OutgoingMessageTooLong);
     }
-    if len > buf.len() {
-        buf.resize(len, 0u8);
+    if len > buf.remaining_mut() {
+        return Err(Error::BufferTooSmall);
     }
+    buf.resize(len, 0u8);
     let bytes = postcard::to_slice(&message, buf)?;
     writer.write_u32(bytes.len() as u32).await?;
     writer.write_all(&bytes).await?;

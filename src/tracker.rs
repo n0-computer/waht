@@ -75,6 +75,8 @@ pub enum Error {
     Timeout,
     #[error("Incoming message too long")]
     IncomingMessageTooLong,
+    #[error("The buffer was too small to store the message")]
+    BufferTooSmall,
     #[error("Outgoing message too long")]
     OutgoingMessageTooLong,
     #[error("IO error: {0}")]

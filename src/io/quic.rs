@@ -170,10 +170,29 @@ pub mod server {
         let state_handle = tokio::spawn(state_actor.run());
 
         let server_config = tls_server_config(config.tls_server_name, config.tls_self_signed)?;
-        let endpoint = bind_server_endpoint(bind_addr, server_config)?;
-        let endpoint_handle = endpoint_actor(endpoint, from_conn_tx);
+        #[cfg(feature = "thread_per_core")]
+        {
+            let mut handles = vec![];
+            let num_threads = (num_cpus::get() - 1).max(1);
+            for _i in 0..num_threads {
+                let from_conn_tx = from_conn_tx.clone();
+                let server_config = server_config.clone();
+                let handle = crate::util::spawn_worker_task(move || async move {
+                    let endpoint = bind_server_endpoint(bind_addr, server_config)?;
+                    endpoint_actor(endpoint, from_conn_tx).await
+                });
+                handles.push(handle);
+            }
+            for handle in handles {
+                handle.await??;
+            }
+        }
+        #[cfg(not(feature = "thread_per_core"))]
+        {
+            let endpoint = bind_server_endpoint(bind_addr, server_config)?;
+            endpoint_actor(endpoint, from_conn_tx).await?;
+        }
 
-        endpoint_handle.await?;
         state_handle.await??;
 
         Ok(())

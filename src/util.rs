@@ -241,3 +241,26 @@ pub mod time {
         // }
     }
 }
+
+#[cfg(feature = "thread_per_core")]
+pub fn spawn_worker_task<F, Fut>(f: F) -> tokio::sync::oneshot::Receiver<Fut::Output>
+where
+    F: (FnOnce() -> Fut) + Send + 'static,
+    Fut: std::future::Future,
+    Fut::Output: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // Spawn a new thread with a tokio current_thread runtime inside that runs
+    // the future returned from the passed-in closure.
+    let _handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime");
+
+        let res = rt.block_on(f());
+        let _ = tx.send(res);
+    });
+    // Return a oneshot receiver that will contain the result of the passed-in future.
+    rx
+}
